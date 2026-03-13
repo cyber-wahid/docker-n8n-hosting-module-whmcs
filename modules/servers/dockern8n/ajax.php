@@ -213,11 +213,9 @@ try {
             break;
             
         case "restart":
-            $stopResult = dockern8n_stop($params);
-            sleep(2);
-            $startResult = dockern8n_start($params);
-            $success = $stopResult === "success" && $startResult === "success";
-            jsonResponse(array("success" => $success, "message" => $success ? "Service restarted successfully" : "Restart partial failure: Stop({$stopResult}), Start({$startResult})"));
+            $result = dockern8n_restart($params);
+            $success = $result === "success";
+            jsonResponse(array("success" => $success, "message" => $success ? "Service restarted successfully" : "Restart failed: " . $result));
             break;
             
         case "reinstall":

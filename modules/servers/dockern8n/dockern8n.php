@@ -2,7 +2,7 @@
 if (!defined("WHMCS")) {
     die("This file cannot be accessed directly");
 }
-define("DOCKERN8N_VERSION", "2.1"); // Auto-infrastructure + Enhanced PUQ Detection
+define("DOCKERN8N_VERSION", "3.0"); // Auto-infrastructure + Enhanced PUQ Detection
 define("DOCKERN8N_GITHUB_REPO", "cyber-wahid/docker-n8n-hosting-module-whmcs");
 define("DOCKERN8N_UPDATE_URL", "https://api.github.com/repos/cyber-wahid/docker-n8n-hosting-module-whmcs/releases/latest");
 define("DOCKERN8N_DEBUG_LOGGING", false);
@@ -593,12 +593,16 @@ function dockern8n_CreateAccount(array $params)
 
         // 3. Mount Logic and Subdir creation
         $mountScript = "
-        if ! grep -q '{$imgFile}' /etc/fstab; then
-            echo '{$imgFile} {$mountDir} ext4 loop 0 0' | sudo tee -a /etc/fstab
+        if ! grep -q '" . $imgFile . "' /etc/fstab; then
+            echo '" . $imgFile . " " . $mountDir . " ext4 loop 0 0' | sudo tee -a /etc/fstab
         fi
-        sudo mount -a 2>/dev/null || mount -o loop {$imgFile} {$mountDir}
-        sudo mkdir -p {$mountDir}/n8n {$mountDir}/postgres
-        sudo chmod -R 777 {$mountDir}
+        sudo mount -a 2>/dev/null || sudo mount -o loop " . $imgFile . " " . $mountDir . "
+        sudo mkdir -p " . $mountDir . "/n8n " . $mountDir . "/postgres " . $mountDir . "/redis 2>/dev/null || true
+        # Final Permissions: Searchable root, specific subdirs
+        sudo chmod 755 " . $mountDir . " 2>/dev/null || true
+        sudo chown -R 1000:1000 " . $mountDir . "/n8n 2>/dev/null || true
+        sudo chown -R 70:70 " . $mountDir . "/postgres 2>/dev/null || true
+        sudo chown -R 999:999 " . $mountDir . "/redis 2>/dev/null || true
         ";
         dockern8n_ssh_RunCommand($hostname, $sshUsername, $sshPassword, $mountScript);
 
@@ -636,9 +640,9 @@ function dockern8n_CreateAccount(array $params)
         dockern8n_ssh_RunCommand($hostname, $sshUsername, $sshPassword, $writeCmd);
 
         // 5. Fire it up! (Synchronous)
-        // Use explicit project name to group container in "Stack"
-        // Try docker compose first, then fallback to old docker-compose, but only if first fails with 'not found'
-        $upCmd = "cd {$serviceDir} && (docker compose -p {$puqProject} up -d 2>&1 || docker-compose -p {$puqProject} up -d 2>&1)";
+        // Ensure permissions one last time before up
+        dockern8n_ssh_RunCommand($hostname, $sshUsername, $sshPassword, "sudo chown -R 1000:1000 " . $mountDir . "/n8n");
+        $upCmd = "cd " . $serviceDir . " && (docker compose -p " . $puqProject . " up -d 2>&1 || docker-compose -p " . $puqProject . " up -d 2>&1)";
         $output = dockern8n_ssh_RunCommand($hostname, $sshUsername, $sshPassword, $upCmd, 300);
 
         if (strpos($output, 'Error') !== false || strpos($output, 'failed') !== false || strpos($output, 'invalid') !== false || (strpos($output, 'command not found') !== false && strpos($output, 'up -d') === false)) {
@@ -677,63 +681,31 @@ function dockern8n_CreateAccount(array $params)
 
 function dockern8n_TerminateAccount(array $params)
 {
-    $serviceId = $params["serviceid"];
-
     try {
-
-        // Get server credentials
+        $serviceId = $params["serviceid"];
         $hostname = $params["serverhostname"] ?: $params["serverip"];
         $username = $params["serverusername"];
         $password = $params["serverpassword"];
 
-        if (empty($hostname) || empty($username) || empty($password)) {
-            $product = Capsule::table("tblproducts")->where("id", $params["packageid"])->first();
-            if ($product && !empty($product->servergroup)) {
-                $server = Capsule::table("tblservers")->where("active", 1)->where("servergroupid", $product->servergroup)->first();
-                if ($server) {
-                    $hostname = $server->hostname ?: $server->ipaddress;
-                    $username = $server->username;
-                    $password = decrypt($server->password);
-                }
-            }
-        }
-
-        // logModuleCall("dockern8n", "TerminateAccount_START", array("serviceId" => $serviceId), '', '');
-
-        // Get domain from database (needed for PUQCloud directory structure)
-        $domain = $params["domain"] ?: "";
-
-        $hostname = $params["serverhostname"] ?: $params["serverip"];
-        $sshUsername = $params["serverusername"];
-        $sshPassword = $params["serverpassword"];
-        $domain = $params["domain"];
-        $serviceId = $params["serviceid"];
-
-        $clientsDir = "/opt/docker/clients";
-        $serviceDir = "{$clientsDir}/{$domain}";
-        $mountDir = "/mnt/{$domain}";
-        $imgFile = "{$serviceDir}/data.img";
-
-        // logModuleCall("dockern8n", "TerminateAccount_START", array("domain" => $domain), "PUQ-Style termination", '');
-
-        // 1. Detect Names
-        $puqInfo = DockerN8N_PUQCompat::detectPUQService($params);
-        $puqContainer = $puqInfo['container_name'] ?: $domain;
-        $puqProject = $puqInfo['project_name'] ?: str_replace(['.', '-'], '', $domain); // Fallback
+        $info = dockern8n_GetContainerInfo($params);
+        $serviceDir = $info['service_dir'];
+        $projectName = $info['project_name'];
+        $containerName = $info['n8n_container'];
+        $mountDir = $info['mount_dir'];
 
         // 1. Stop and Remove Project/Containers
-        // Use -p to ensure we hit the right stack
-        $stopCmd = "cd {$serviceDir} && (docker compose -p {$puqProject} down -v || docker-compose -p {$puqProject} down -v || docker stop {$puqContainer}) 2>/dev/null || true";
-        dockern8n_ssh_RunCommand($hostname, $sshUsername, $sshPassword, $stopCmd);
+        $stopCmd = "cd " . $serviceDir . " && (docker compose -p " . $projectName . " down -v --remove-orphans || docker-compose -p " . $projectName . " down -v --remove-orphans || (docker stop " . $containerName . " && docker rm " . $containerName . ")) 2>/dev/null || true";
+        dockern8n_ssh_RunCommand($hostname, $username, $password, $stopCmd);
 
-        // 2. Unmount and fstab cleanup
+        // 2. Cleanup directories and mounts
         $cleanupScript = "
-        sudo umount -l {$mountDir} 2>/dev/null || true
-        sudo sed -i '\|{$imgFile} {$mountDir}|d' /etc/fstab
-        sudo rm -rf {$serviceDir}
-        sudo rm -rf {$mountDir}
+        sudo umount -l " . $mountDir . " 2>/dev/null || true
+        # Remove from fstab if exists
+        sudo sed -i '\| " . $mountDir . " |d' /etc/fstab 2>/dev/null || true
+        sudo rm -rf " . $serviceDir . " 2>/dev/null || true
+        sudo rm -rf " . $mountDir . " 2>/dev/null || true
         ";
-        dockern8n_ssh_RunCommand($hostname, $sshUsername, $sshPassword, $cleanupScript);
+        dockern8n_ssh_RunCommand($hostname, $username, $password, $cleanupScript);
 
         // 3. Clear Metadata
         $customField = Capsule::table("tblcustomfields")->where("relid", $params["packageid"])->where("fieldname", "Service Details")->first();
@@ -741,10 +713,9 @@ function dockern8n_TerminateAccount(array $params)
             Capsule::table("tblcustomfieldsvalues")->where("fieldid", $customField->id)->where("relid", $serviceId)->delete();
         }
 
-        dockern8n_LogActivity($params, "service_terminated", "N8N Terminated and cleaned up (PUQ-Style)");
+        dockern8n_LogActivity($params, "service_terminated", "N8N service stack terminated and cleaned up");
         return "success";
     } catch (Exception $e) {
-        // logModuleCall("dockern8n", "TerminateAccount_EXCEPTION", array("serviceId" => $serviceId), $e->getMessage(), '');
         return "Termination Failed: " . $e->getMessage();
     }
 }
@@ -759,27 +730,23 @@ function dockern8n_SuspendAccount(array $params)
         $hostname = $params["serverhostname"] ?: $params["serverip"];
         $sshUsername = $params["serverusername"];
         $sshPassword = $params["serverpassword"];
-        $domain = $params["domain"];
 
-        $serviceDir = "/opt/docker/clients/{$domain}";
-        $mountDir = "/mnt/{$domain}";
+        $info = dockern8n_GetContainerInfo($params);
+        $serviceDir = $info['service_dir'];
+        $projectName = $info['project_name'];
+        $containerName = $info['n8n_container'];
+        $mountDir = $info['mount_dir'];
 
-        // logModuleCall("dockern8n", "SuspendAccount_START", array("domain" => $domain), "PUQ-Style suspension", '');
-
-        // Detect Names and Paths
-        $puqInfo = DockerN8N_PUQCompat::detectPUQService($params);
-        $puqContainer = $puqInfo['container_name'] ?: $domain;
-        $puqProject = $puqInfo['project_name'] ?: str_replace(['.', '-'], '', $domain);
-        $serviceDir = $puqInfo['service_dir'] ?: "/opt/docker/clients/{$domain}";
-
-        // 1. Stop Containers
-        $stopCmd = "cd {$serviceDir} && (docker compose -p {$puqProject} stop || docker-compose -p {$puqProject} stop || docker stop {$puqContainer}) 2>/dev/null";
+        // 1. Stop Containers using project name or fallback
+        $stopCmd = "cd {$serviceDir} && (docker compose -p {$projectName} stop || docker-compose -p {$projectName} stop || docker stop {$containerName}) 2>/dev/null";
         dockern8n_ssh_RunCommand($hostname, $sshUsername, $sshPassword, $stopCmd);
 
         // 2. Unmount (Optional but recommended for safety)
-        dockern8n_ssh_RunCommand($hostname, $sshUsername, $sshPassword, "sudo umount -l {$mountDir} 2>/dev/null || true");
+        if (!empty($mountDir)) {
+            dockern8n_ssh_RunCommand($hostname, $sshUsername, $sshPassword, "sudo umount -l {$mountDir} 2>/dev/null || true");
+        }
 
-        dockern8n_LogActivity($params, "service_suspended", "N8N suspended and unmounted.");
+        dockern8n_LogActivity($params, "service_suspended", "N8N service stack suspended (stopped and unmounted).");
         return "success";
     } catch (Exception $e) {
         return "Suspend Failed: " . $e->getMessage();
@@ -792,56 +759,41 @@ function dockern8n_SuspendAccount(array $params)
  */
 function dockern8n_UnsuspendAccount(array $params)
 {
-    $serviceId = $params["serviceid"];
     try {
-
         $hostname = $params["serverhostname"] ?: $params["serverip"];
         $username = $params["serverusername"];
         $password = $params["serverpassword"];
 
-        // Fallback to server group if no direct server
-        if (empty($hostname) || empty($username) || empty($password)) {
-            $product = Capsule::table("tblproducts")->where("id", $params["packageid"])->first();
-            if ($product && !empty($product->servergroup)) {
-                $server = Capsule::table("tblservers")->where("active", 1)->where("servergroupid", $product->servergroup)->first();
-                if ($server) {
-                    $hostname = $server->hostname ?: $server->ipaddress;
-                    $username = $server->username;
-                    $password = decrypt($server->password);
-                }
-            }
-        }
-
-        // logModuleCall("dockern8n", "UnsuspendAccount_START", ["serviceId" => $serviceId], '', '');
-
-        // Get domain and determine service directory
-        $domain = $params["domain"] ?: "";
-        $serviceDir = "";
-
-        if (!empty($domain) && $domain !== "domain.com") {
-            $serviceDir = dockern8n_GetServiceDirectory($domain, $serviceId, true);
-        } else {
-            $serviceDir = "/var/www/dockern8n/service-{$serviceId}";
-        }
-
-        // logModuleCall("dockern8n", "UnsuspendAccount_Directory", ["dir" => $serviceDir], "Target directory", '');
+        $info = dockern8n_GetContainerInfo($params);
+        $serviceDir = $info['service_dir'];
+        $projectName = $info['project_name'];
+        $containerName = $info['n8n_container'];
 
         // PUQ Compatibility: Ensure disk is mounted before starting
-        if (strpos($serviceDir, '/opt/docker/clients') !== false) {
-            $mountCmd = "mount -a 2>&1"; // This will mount entries from fstab
+        if ($info['is_puq']) {
+            $mountCmd = "sudo mount -a 2>/dev/null && sudo chown -R 1000:1000 " . $info['mount_dir'] . " && sleep 1";
             dockern8n_ssh_RunCommand($hostname, $username, $password, $mountCmd);
+        } else {
+            // Native: ensure bind mount permissions
+            // Ensure permissions before starting
+        if ($info['is_puq']) {
+            dockern8n_ssh_RunCommand($hostname, $username, $password, "sudo chown -R 1000:1000 " . $info['mount_dir'] . "/n8n 2>/dev/null; sudo chown -R 70:70 " . $info['mount_dir'] . "/postgres 2>/dev/null; sudo chown -R 999:999 " . $info['mount_dir'] . "/redis 2>/dev/null");
+        } else {
+            dockern8n_ssh_RunCommand($hostname, $username, $password, "sudo chown -R 1000:1000 " . $info['mount_dir'] . " 2>/dev/null");
+        }
         }
 
-        // Start containers
-        $cmdStart = "cd {$serviceDir} && (docker compose start || docker-compose start || docker compose up -d) 2>&1";
+        // Start containers using project up or fallback
+        $cmdStart = "cd " . $serviceDir . " && (docker compose -p " . $projectName . " up -d || docker-compose -p " . $projectName . " up -d || docker start " . $containerName . ") 2>&1";
         $output = dockern8n_ssh_RunCommand($hostname, $username, $password, $cmdStart);
 
-        // logModuleCall("dockern8n", "UnsuspendAccount_SUCCESS", ["serviceId" => $serviceId], $output, '');
-        dockern8n_LogActivity($params, "service_unsuspended", "N8N service unsuspended - payment received. Disk checked & Container started.");
+        if (stripos($output, 'error') !== false && stripos($output, 'started') === false && stripos($output, 'running') === false && stripos($output, 'done') === false) {
+             return "Unsuspend failed: " . substr(strip_tags($output), 0, 150);
+        }
 
+        dockern8n_LogActivity($params, "service_unsuspended", "N8N service stack unsuspended (started).");
         return "success";
     } catch (Exception $e) {
-        // logModuleCall("dockern8n", "UnsuspendAccount_EXCEPTION", ["serviceId" => $serviceId], $e->getMessage(), '');
         return "Unsuspend Failed: " . $e->getMessage();
     }
 }
@@ -1153,7 +1105,6 @@ function dockern8n_ChangePackage($params)
         $username = $params["serverusername"];
         $password = $params["serverpassword"];
         $serviceId = $params["serviceid"];
-        $domain = $params["domain"];
 
         $newCpuLimit = $params["configoption2"] ?: "1";
         $newMemoryLimit = $params["configoption3"] ?: "1G";
@@ -1162,45 +1113,48 @@ function dockern8n_ChangePackage($params)
         $newDiskLimitRaw = $params["configoption5"] ?: "10";
         $newDiskLimit = (is_numeric($newDiskLimitRaw)) ? $newDiskLimitRaw . "G" : $newDiskLimitRaw;
 
-        // Detect correct service directory (PUQ vs Legacy)
-        if (!function_exists('dockern8n_GetServiceDirectory')) {
-            require_once __DIR__ . '/DomainHelpers.php';
-        }
-        $serviceDir = dockern8n_GetServiceDirectory($domain, $serviceId, true);
-
-        $composeFile = "{$serviceDir}/docker-compose.yml";
+        // Detect correct service directory and project
+        $info = dockern8n_GetContainerInfo($params);
+        $serviceDir = $info['service_dir'];
+        $projectName = $info['project_name'];
+        $composeFile = $info['compose_file'];
 
         // Verify file exists before cat
-        $checkCmd = "[ -f {$composeFile} ] && echo 'found' || echo 'missing'";
+        $checkCmd = "[ -f " . $composeFile . " ] && echo 'found' || echo 'missing'";
         $check = trim(dockern8n_ssh_RunCommand($hostname, $username, $password, $checkCmd));
 
         if ($check !== 'found') {
-            throw new Exception("docker-compose.yml not found at {$serviceDir}");
+            throw new Exception("docker-compose.yml not found at " . $composeFile);
         }
 
-        $cmdRead = "cat {$composeFile}";
+        $cmdRead = "cat " . $composeFile;
         $composeContent = dockern8n_ssh_RunCommand($hostname, $username, $password, $cmdRead);
 
-        // Update Resource Limits
-        $composeContent = preg_replace("/cpus:\s*['\"]?[\d.]+['\"]?/", "cpus: '{$newCpuLimit}'", $composeContent);
-        $composeContent = preg_replace("/memory:\s*['\"]?[\dGMKB]+['\"]?/", "memory: '{$newMemoryLimit}'", $composeContent);
+        // Update Resource Limits using regex (more robust)
+        $composeContent = preg_replace("/cpus:\s*['\"]?[\d.]+['\"]?/", "cpus: '" . $newCpuLimit . "'", $composeContent);
+        $composeContent = preg_replace("/memory:\s*['\"]?[\dGMKB]+['\"]?/", "memory: '" . $newMemoryLimit . "'", $composeContent);
 
         // Note: We update the compose file to reflect the new limit 
-        $composeContent = preg_replace("/size:\s*['\"]?[\dGMKB]+['\"]?/", "size: '{$newDiskLimit}'", $composeContent);
+        $composeContent = preg_replace("/size:\s*['\"]?[\dGMKB]+['\"]?/", "size: '" . $newDiskLimit . "'", $composeContent);
 
         $b64Compose = base64_encode($composeContent);
-        $cmdWrite = "echo '{$b64Compose}' | base64 -d > {$composeFile}";
+        $cmdWrite = "echo '" . $b64Compose . "' | base64 -d > " . $composeFile;
         dockern8n_ssh_RunCommand($hostname, $username, $password, $cmdWrite);
 
         // Restart Container to apply changes
-        // Use 'docker compose' (v2) with fallback
-        $cmdRestart = "cd {$serviceDir} && (docker compose up -d --force-recreate || docker-compose up -d --force-recreate)";
-        dockern8n_ssh_RunCommand($hostname, $username, $password, $cmdRestart);
+        $cmdRestart = "cd " . $serviceDir . " && (docker compose -p " . $projectName . " up -d --force-recreate || docker-compose -p " . $projectName . " up -d --force-recreate)";
+        $output = dockern8n_ssh_RunCommand($hostname, $username, $password, $cmdRestart, 120);
 
-        logActivity("DockerN8N Package Upgrade - Service ID: {$serviceId}, CPU: {$newCpuLimit}, RAM: {$newMemoryLimit}, Disk: {$newDiskLimit}");
+        if (stripos($output, 'error') !== false && stripos($output, 'done') === false && stripos($output, 'started') === false) {
+             return "Package upgrade failed: " . substr(strip_tags($output), 0, 150);
+        }
+
+        logActivity("DockerN8N Package Upgrade - Service ID: " . $serviceId . ", CPU: " . $newCpuLimit . ", RAM: " . $newMemoryLimit . ", Disk: " . $newDiskLimit);
+        dockern8n_LogActivity($params, "package_changed", "Package changed. CPU: {$newCpuLimit}, RAM: {$newMemoryLimit}, Disk: {$newDiskLimit}");
+        
         return "success";
     } catch (Exception $e) {
-        logActivity("DockerN8N Package Upgrade Failed - Service ID: {$serviceId}, Error: " . $e->getMessage());
+        logActivity("DockerN8N Package Upgrade Failed - Service ID: " . $params['serviceid'] . ", Error: " . $e->getMessage());
         return "Package upgrade failed: " . $e->getMessage();
     }
 }
@@ -1398,10 +1352,14 @@ function dockern8n_GetStatus($params)
         $username = $params["serverusername"];
         $password = $params["serverpassword"];
 
+        $info = dockern8n_GetContainerInfo($params);
+        $n8nContainer = $info['n8n_container'];
+        $pgContainer = $info['postgres_container'];
+
         // Use batch command - ONE SSH call instead of TWO
         $commands = array(
-            "docker inspect --format='{{.State.Status}}' service-{$serviceId}-n8n 2>/dev/null || echo 'deleted'",
-            "docker inspect --format='{{.State.Status}}' service-{$serviceId}-postgres 2>/dev/null || echo 'not_found'"
+            "docker inspect --format='{{.State.Status}}' {$n8nContainer} 2>/dev/null || echo 'deleted'",
+            "docker inspect --format='{{.State.Status}}' {$pgContainer} 2>/dev/null || echo 'not_found'"
         );
 
         $results = dockern8n_ssh_RunBatch($hostname, $username, $password, $commands);
@@ -1599,9 +1557,16 @@ function dockern8n_start($params)
         $projectName = $info['project_name'];
         $containerName = $info['n8n_container'];
 
-        // PUQ Compatibility: Ensure disk is mounted
+        // PUQ Compatibility: Ensure disk is mounted and permissions are correct
         if ($info['is_puq']) {
-            dockern8n_ssh_RunCommand($hostname, $username, $password, "mount -a 2>/dev/null && sleep 1");
+            $mountDir = $info['mount_dir'];
+            $permCmd = "sudo chmod 755 {$mountDir}; sudo chown -R 1000:1000 {$mountDir}/n8n 2>/dev/null; sudo chown -R 70:70 {$mountDir}/postgres 2>/dev/null; sudo chown -R 999:999 {$mountDir}/redis 2>/dev/null";
+            dockern8n_ssh_RunCommand($hostname, $username, $password, "mount -a 2>/dev/null; {$permCmd}; sleep 1");
+        } else {
+            // Native: ensure bind mount permissions
+            $mountDir = $info['mount_dir'];
+            $permCmd = "sudo chmod 755 {$mountDir}; sudo chown -R 1000:1000 {$mountDir}/n8n 2>/dev/null; sudo chown -R 70:70 {$mountDir}/postgres 2>/dev/null; sudo chown -R 999:999 {$mountDir}/redis 2>/dev/null";
+            dockern8n_ssh_RunCommand($hostname, $username, $password, $permCmd);
         }
 
         // Start using project name or direct container name
@@ -1619,7 +1584,41 @@ function dockern8n_start($params)
         }
 
         logActivity("DockerN8N Start - Service ID: " . $params['serviceid'] . " Result: " . trim($output));
-        dockern8n_LogActivity($params, "service_started", "N8N service stack starting...");
+        
+        if (stripos($output, 'error') !== false && stripos($output, 'started') === false && stripos($output, 'running') === false && stripos($output, 'done') === false) {
+             return "Start failed: " . substr(strip_tags($output), 0, 150);
+        }
+
+        dockern8n_LogActivity($params, "service_started", "N8N service stack started");
+        return "success";
+    } catch (Exception $e) {
+        return "Error: " . $e->getMessage();
+    }
+}
+
+function dockern8n_restart($params)
+{
+    try {
+        $hostname = $params["serverhostname"] ?: $params["serverip"];
+        $username = $params["serverusername"];
+        $password = $params["serverpassword"];
+
+        $info = dockern8n_GetContainerInfo($params);
+        $serviceDir = $info['service_dir'];
+        $projectName = $info['project_name'];
+        $containerName = $info['n8n_container'];
+
+        // Restart using project name or direct container name
+        $cmd = "cd {$serviceDir} && (docker compose -p {$projectName} restart || docker-compose -p {$projectName} restart || docker restart {$containerName}) 2>&1";
+        $output = dockern8n_ssh_RunCommand($hostname, $username, $password, $cmd, 60);
+
+        logActivity("DockerN8N Restart - Service ID: " . $params['serviceid'] . " Result: " . trim($output));
+
+        if (stripos($output, 'Error') !== false && stripos($output, 'Restarted') === false) {
+             return "Restart failed: " . substr(strip_tags($output), 0, 150);
+        }
+
+        dockern8n_LogActivity($params, "service_restarted", "N8N service stack restarted");
         return "success";
     } catch (Exception $e) {
         return "Error: " . $e->getMessage();
@@ -1642,6 +1641,11 @@ function dockern8n_stop($params)
         $output = dockern8n_ssh_RunCommand($hostname, $username, $password, $cmd, 60);
 
         logActivity("DockerN8N Stop - Service ID: " . $params['serviceid'] . " Result: " . trim($output));
+
+        if (stripos($output, 'Error') !== false && stripos($output, 'Stopped') === false) {
+             return "Stop failed: " . substr(strip_tags($output), 0, 150);
+        }
+
         dockern8n_LogActivity($params, "service_stopped", "N8N service stack stopped");
         return "success";
     } catch (Exception $e) {
@@ -1789,15 +1793,8 @@ function dockern8n_GetResourceStats($params)
         $serviceId = $params["serviceid"];
         $domain = $params['domain'];
 
-        // Detect container name based on module
-        $containerName = "service-{$serviceId}-n8n";
-        $puqInfo = DockerN8N_PUQCompat::detectPUQService($params);
-
-        if ($puqInfo['is_puq']) {
-            // PUQCloud uses domain as container name
-            $containerName = $puqInfo['container_name'];
-            // logModuleCall('dockern8n', 'GetResourceStats_PUQ', ['container' => $containerName], 'Using PUQ container name', '');
-        }
+        $info = dockern8n_GetContainerInfo($params);
+        $containerName = $info['n8n_container'];
 
         $cmd = "docker stats {$containerName} --no-stream --format '{{.CPUPerc}}|{{.MemUsage}}|{{.NetIO}}|{{.BlockIO}}'";
         $output = dockern8n_ssh_RunCommand($hostname, $username, $password, $cmd);
@@ -1837,31 +1834,74 @@ function dockern8n_GetDiskUsage($params)
             return array("used" => $diskUsed ?: "0B", "limit" => $diskLimit, "percent" => $percentUsed, "n8n_data" => $diskUsed ?: "0B", "postgres_data" => "0B");
         }
 
-        // Our module - use volume names
-        $volumePrefix = "service-{$serviceId}";
-        $cmdN8n = "docker system df -v 2>/dev/null | grep '{$volumePrefix}_n8n_data' | awk '{print $3}'";
-        $n8nSize = trim(dockern8n_ssh_RunCommand($hostname, $username, $password, $cmdN8n));
-        $cmdPg = "docker system df -v 2>/dev/null | grep '{$volumePrefix}_postgres_data' | awk '{print $3}'";
-        $pgSize = trim(dockern8n_ssh_RunCommand($hostname, $username, $password, $cmdPg));
-        if (empty($n8nSize)) {
-            $cmdDir = "du -sh /var/lib/docker/volumes/{$volumePrefix}_n8n_data/_data 2>/dev/null | cut -f1";
-            $n8nSize = trim(dockern8n_ssh_RunCommand($hostname, $username, $password, $cmdDir));
+        // Our module - use volume names or bind mount
+        $projectName = $info['project_name'];
+        $mountDir = $info['mount_dir'];
+
+        // Try getting size from docker volume first
+        $volumeName = $projectName . "_n8n_data";
+        $cmdSize = "docker system df -v 2>/dev/null | grep '" . $volumeName . "' | awk '{print $3}'";
+        $sizeStr = trim(dockern8n_ssh_RunCommand($hostname, $username, $password, $cmdSize));
+
+        if (empty($sizeStr) || $sizeStr == "0B") {
+            // Fallback to du on the mount directory
+            $cmdDu = "[ -d " . $mountDir . " ] && du -sh " . $mountDir . " 2>/dev/null | cut -f1 || echo '0B'";
+            $sizeStr = trim(dockern8n_ssh_RunCommand($hostname, $username, $password, $cmdDu));
         }
-        if (empty($pgSize)) {
-            $cmdDir = "du -sh /var/lib/docker/volumes/{$volumePrefix}_postgres_data/_data 2>/dev/null | cut -f1";
-            $pgSize = trim(dockern8n_ssh_RunCommand($hostname, $username, $password, $cmdDir));
-        }
-        $diskLimit = "5G";
-        if (isset($params["configoption5"]) && !empty($params["configoption5"])) {
-            $diskLimit = $params["configoption5"];
-        }
-        $totalBytes = dockern8n_parseDiskSize($n8nSize ?: "0") + dockern8n_parseDiskSize($pgSize ?: "0");
+
+        $diskLimitRaw = isset($params["configoption5"]) ? $params["configoption5"] : "10";
+        $diskLimit = is_numeric($diskLimitRaw) ? $diskLimitRaw . "G" : $diskLimitRaw;
+        
+        $usedBytes = dockern8n_parseDiskSize($sizeStr ?: "0");
         $limitBytes = dockern8n_parseDiskSize($diskLimit);
-        $usedFormatted = dockern8n_formatBytes($totalBytes);
-        $percentUsed = $limitBytes > 0 ? round($totalBytes / $limitBytes * 100, 1) : 0;
-        return array("used" => $usedFormatted, "limit" => $diskLimit, "percent" => $percentUsed, "n8n_data" => $n8nSize ?: "0B", "postgres_data" => $pgSize ?: "0B");
+        $percentUsed = $limitBytes > 0 ? round($usedBytes / $limitBytes * 100, 1) : 0;
+
+        return array("used" => $sizeStr ?: "0B", "limit" => $diskLimit, "percent" => $percentUsed, "n8n_data" => $sizeStr ?: "0B", "postgres_data" => "0B");
     } catch (Exception $e) {
         return array("used" => "0B", "limit" => "Unknown", "percent" => 0, "error" => $e->getMessage());
+    }
+}
+
+/**
+ * Usage Update - Called by WHMCS cron to collect disk usage stats
+ */
+function dockern8n_UsageUpdate($params)
+{
+    try {
+        $serverid = $params['serverid'];
+
+        $services = Capsule::table('tblhosting')
+            ->where('server', $serverid)
+            ->whereIn('domainstatus', ['Active', 'Suspended'])
+            ->get();
+
+        foreach ($services as $service) {
+            $usage = dockern8n_GetDiskUsage([
+                'serviceid' => $service->id,
+                'domain' => $service->domain,
+                'packageid' => $service->packageid,
+                'serverhostname' => $params['serverhostname'],
+                'serverip' => $params['serverip'],
+                'serverusername' => $params['serverusername'],
+                'serverpassword' => $params['serverpassword'],
+                'configoption5' => Capsule::table('tblproducts')->where('id', $service->packageid)->value('configoption5')
+            ]);
+            
+            // Convert to MB for WHMCS
+            $usedBytes = dockern8n_parseDiskSize($usage['used']);
+            $usedMB = round($usedBytes / (1024 * 1024), 2);
+            
+            $limitBytes = dockern8n_parseDiskSize($usage['limit']);
+            $limitMB = round($limitBytes / (1024 * 1024), 2);
+
+            Capsule::table('tblhosting')->where('id', $service->id)->update([
+                'diskusage' => $usedMB,
+                'disklimit' => $limitMB,
+                'lastupdate' => date('Y-m-d H:i:s'),
+            ]);
+        }
+    } catch (Exception $e) {
+        logActivity("DockerN8N Usage Update Failed: " . $e->getMessage());
     }
 }
 
@@ -1895,9 +1935,8 @@ function dockern8n_GetLogs($params, $lines = 100)
         $password = $params["serverpassword"];
         $serviceId = $params["serviceid"];
 
-        // Detect PUQ vs our container
-        $puqInfo = DockerN8N_PUQCompat::detectPUQService($params);
-        $containerName = $puqInfo['is_puq'] ? $puqInfo['container_name'] : "service-{$serviceId}-n8n";
+        $info = dockern8n_GetContainerInfo($params);
+        $containerName = $info['n8n_container'];
 
         $cmd = "docker logs {$containerName} --tail {$lines} 2>&1";
         $output = dockern8n_ssh_RunCommand($hostname, $username, $password, $cmd);
@@ -1986,54 +2025,111 @@ function dockern8n_ChangePassword($params)
 
                 if ($changes === "1")
                     return ['success' => true, 'email' => $email];
-                return ['success' => false, 'error' => "Update 0 rows for {$email}. Raw Output: {$result}"];
+                return ['success' => false, 'error' => "Update 0 rows for {$email}. Output: {$result}"];
             }
             return ['success' => false, 'error' => "User not found. Output: {$rawOutput}"];
         };
 
+        // SQLite Executor using sidecar (Alpine + SQLite) if host tools missing
+        $runSidecarSqlite = function($volumeOrPath, $sql) use ($hostname, $username, $password) {
+             $isPath = (strpos($volumeOrPath, '/') !== false);
+             $mountSource = $isPath ? $volumeOrPath : $volumeOrPath;
+             $dbFile = "database.sqlite";
+             
+             // If $volumeOrPath is a path, we mount it directly
+             $mountParam = "-v \"{$volumeOrPath}\":/data";
+             $sqlSafe = str_replace("'", "'\\''", $sql);
+             
+             $cmd = "docker run --rm {$mountParam} alpine sh -c \"apk add --no-cache sqlite >/dev/null 2>&1 && sqlite3 /data/{$dbFile} '{$sqlSafe}'\"";
+             return dockern8n_ssh_RunCommand($hostname, $username, $password, $cmd);
+        };
+
+        // --- 0. POSTGRES DISCOVERY (PROACTIVE) ---
+        $info = dockern8n_GetContainerInfo($params);
+        $cleanDomain = preg_replace("#^https?://#", '', $params['domain'] ?? '');
+        $projectFilter = $info['project_name'] ?? $serviceId;
+        
+        $findPgCmd = "docker ps --format '{{.Names}}' | grep -E 'postgres|db' | grep -E '{$serviceId}|{$cleanDomain}|{$projectFilter}' | head -n 1";
+        $pgContainer = trim(dockern8n_ssh_RunCommand($hostname, $username, $password, $findPgCmd));
+        
+        if (empty($pgContainer)) {
+            $inspectPg = "docker inspect {$n8nContainer} --format '{{range .NetworkSettings.Networks}}{{.Links}}{{end}}' 2>/dev/null";
+            $links = trim(dockern8n_ssh_RunCommand($hostname, $username, $password, $inspectPg));
+            if (!empty($links) && strpos($links, ':') !== false) {
+                $pgContainer = explode(':', $links)[0];
+            }
+        }
+
         $errors = [];
-
-        // --- STRATEGY: MOUNT INSPECTION ---
-        // Instead of guessing PUQ vs Standard, let's ask Docker where the data is.
-
-        // 1. Inspect n8n container to find /home/node/.n8n mount
-        $inspectCmd = "docker inspect -f '{{range .Mounts}}{{if eq .Destination \"/home/node/.n8n\"}}{{.Type}}|{{.Source}}{{end}}{{end}}' {$n8nContainer}";
-        $mountInfo = trim(dockern8n_ssh_RunCommand($hostname, $username, $password, $inspectCmd));
-
-        // logModuleCall('dockern8n', 'ChangePassword_Inspect', ['container' => $n8nContainer, 'mount' => $mountInfo], 'Mount Info', '');
-
         $dbUpdated = false;
 
-        if (!empty($mountInfo)) {
-            $parts = explode("|", $mountInfo);
-            $type = $parts[0] ?? '';
-            $source = $parts[1] ?? '';
+        // --- STRATEGY A: POSTGRES (If Detected) ---
+        if (!empty($pgContainer)) {
+            // Use robust quoting for Postgres: "user" table and "createdAt" column
+            // We pass the SQL via -c to avoid echo/pipe escaping issues
+            $findEmailSql = 'SELECT "email" FROM "user" ORDER BY "createdAt" ASC LIMIT 1;';
+            $findEmailCmd = "docker exec -i {$pgContainer} psql -U n8n -d n8n -t -A -c " . escapeshellarg($findEmailSql) . " 2>&1";
+            $pgEmail = trim(dockern8n_ssh_RunCommand($hostname, $username, $password, $findEmailCmd));
 
-            if ($type === 'bind') {
-                // BIND MOUNT -> File is on Host -> Use Host SQLite
-                $dbPath = $source . "/database.sqlite";
-                // logModuleCall('dockern8n', 'ChangePassword_Strategy', ['type' => 'bind', 'path' => $dbPath], 'Using Host SQLite', '');
+            if (!empty($pgEmail) && strpos($pgEmail, '@') !== false) {
+                $pgEmailSql = str_replace("'", "''", $pgEmail);
+                $bcryptHashSql = str_replace("'", "''", $bcryptHash);
 
-                $res = $tryUpdateUser($runHostSqlite, $dbPath);
-                if ($res['success']) {
+                $sqlInner = "UPDATE \"user\" SET \"password\" = '{$bcryptHashSql}' WHERE \"email\" = '{$pgEmailSql}';";
+                $updateCmd = "docker exec -i {$pgContainer} psql -U n8n -d n8n -c " . escapeshellarg($sqlInner) . " 2>&1";
+                $pgRes = dockern8n_ssh_RunCommand($hostname, $username, $password, $updateCmd);
+
+                if (strpos($pgRes, "UPDATE 1") !== false) {
                     $dbUpdated = true;
                 } else {
-                    $errors[] = "Host SQLite: " . $res['error'];
+                    $errors[] = "Postgres Update ({$pgContainer}): " . $pgRes;
                 }
+            } else {
+                 $errors[] = "Postgres ({$pgContainer}) query failed or user not found: " . trim($pgEmail);
+            }
+        }
 
-            } elseif ($type === 'volume') {
-                // VOLUME -> Data in Docker Volume -> Use Ephemeral Container
-                // logModuleCall('dockern8n', 'ChangePassword_Strategy', ['type' => 'volume', 'source' => $source], 'Using Ephemeral SQLite', '');
+        // --- STRATEGY B: SQLITE MOUNT INSPECTION (If Postgres failed or not found) ---
+        if (!$dbUpdated) {
+            // 1. Inspect n8n container to find /home/node/.n8n mount
+            $inspectCmd = "docker inspect -f '{{range .Mounts}}{{if eq .Destination \"/home/node/.n8n\"}}{{.Type}}|{{.Source}}{{end}}{{end}}' {$n8nContainer}";
+            $mountInfo = trim(dockern8n_ssh_RunCommand($hostname, $username, $password, $inspectCmd));
 
-                $res = $tryUpdateUser($runEphemeralSqlite, $source);
-                if ($res['success']) {
-                    $dbUpdated = true;
-                } else {
-                    $errors[] = "Ephemeral SQLite: " . $res['error'];
+            // logModuleCall('dockern8n', 'ChangePassword_Inspect', ['container' => $n8nContainer, 'mount' => $mountInfo], 'Mount Info', '');
+
+            if (!empty($mountInfo)) {
+                $parts = explode("|", $mountInfo);
+                $type = $parts[0] ?? '';
+                $source = $parts[1] ?? '';
+
+                if ($type === 'bind') {
+                    // BIND MOUNT -> File is on Host -> Use Host SQLite
+                    $dbPath = $source . "/database.sqlite";
+                    // logModuleCall('dockern8n', 'ChangePassword_Strategy', ['type' => 'bind', 'path' => $dbPath], 'Using Host SQLite', '');
+
+                    $res = $tryUpdateUser($runHostSqlite, $dbPath);
+                    if ($res['success']) {
+                        $dbUpdated = true;
+                    } else {
+                        // Host SQLite failed (likely missing tool), try Sidecar
+                        $res2 = $tryUpdateUser($runSidecarSqlite, $source);
+                        if ($res2['success']) {
+                            $dbUpdated = true;
+                        } else {
+                             $errors[] = "Host/Sidecar SQLite: " . $res2['error'];
+                        }
+                    }
+
+                } elseif ($type === 'volume') {
+                    // VOLUME -> Data in Docker Volume -> Use Ephemeral Container
+                    $res = $tryUpdateUser($runEphemeralSqlite, $source);
+                    if ($res['success']) {
+                        $dbUpdated = true;
+                    } else {
+                        $errors[] = "Ephemeral SQLite: " . $res['error'];
+                    }
                 }
             }
-        } else {
-            $errors[] = "Could not identify mount type for {$n8nContainer}";
         }
 
         if ($dbUpdated) {
@@ -2041,83 +2137,20 @@ function dockern8n_ChangePassword($params)
             return "success";
         }
 
-        // --- FALLBACKS (If Mount Inspection Failed) ---
-
-        // 1. Try Postgres (for pgsql stacks)
-        // Heuristic discovery of PG container
-        $cleanDomain = preg_replace("#^https?://#", '', $params['domain']);
-        $projectFilter = $puqInfo['project_name'] ?? $serviceId;
-        $findPgCmd = "docker ps --format '{{.Names}}' | grep 'postgres' | grep -E '{$serviceId}|{$cleanDomain}|{$projectFilter}' | head -n 1";
-        $pgContainer = trim(dockern8n_ssh_RunCommand($hostname, $username, $password, $findPgCmd));
-
-        if (!empty($pgContainer)) {
-            // Try to find the first user's email in Postgres
-            $findEmailSql = "SELECT email FROM \"user\" ORDER BY \"createdAt\" ASC LIMIT 1;";
-            // Escape SQL for shell just to be safe
-            $findEmailSqlSafe = str_replace("'", "'\\''", $findEmailSql);
-            $findEmailCmd = "echo '{$findEmailSqlSafe}' | docker exec -i {$pgContainer} psql -U n8n -d n8n -t -A 2>&1";
-            $pgEmail = trim(dockern8n_ssh_RunCommand($hostname, $username, $password, $findEmailCmd));
-
-            if (!empty($pgEmail) && strpos($pgEmail, '@') !== false) {
-                // Escape for SQL (Postgres escapes ' as '')
-                $pgEmailSql = str_replace("'", "''", $pgEmail);
-                $bcryptHashSql = str_replace("'", "''", $bcryptHash);
-
-                $sqlInner = "UPDATE \"user\" SET password = '{$bcryptHashSql}' WHERE email = '{$pgEmailSql}';";
-
-                // Escape entire SQL string for Shell (bash single quotes)
-                $sqlShellSafe = str_replace("'", "'\\''", $sqlInner);
-
-                // Use psql without -t -A to see UPDATE 1 output
-                $rawCmd = "echo '{$sqlShellSafe}' | docker exec -i {$pgContainer} psql -U n8n -d n8n 2>&1";
-                $pgRes = dockern8n_ssh_RunCommand($hostname, $username, $password, $rawCmd);
-
-                if (strpos($pgRes, "UPDATE 1") !== false) {
-                    dockern8n_ssh_RunCommand($hostname, $username, $password, "docker restart {$n8nContainer}");
-                    return "success";
-                }
-                $errors[] = "Postgres Update ({$pgContainer}): " . $pgRes;
-            } else {
-                $errors[] = "Postgres Email Find ({$pgContainer}): " . $pgEmail;
-            }
-        }
-
-        // 2. Final CLI Fallback
-
+        // 2. Final CLI Fallback - REMOVED DESTRUCTIVE RESET
+        // For Password Change, we must NOT use user-management:reset as it wipes users and roles.
+        // We only provide a final attempt via reset-owner if available.
         $safeEmail = escapeshellarg($clientEmail);
         $safePassword = escapeshellarg($newPassword);
         $cmd_reset_owner = "docker exec -i {$n8nContainer} n8n user-management:reset-owner --email={$safeEmail} --password={$safePassword} 2>&1";
         $cliRes_reset_owner = dockern8n_ssh_RunCommand($hostname, $username, $password, $cmd_reset_owner);
 
-        if (stripos($cliRes_reset_owner, "successfully") !== false || stripos($cliRes_reset_owner, "updated") !== false) {
+        if (stripos($cliRes_reset_owner, "successfully") !== false) {
             return "success";
         }
 
-        // Only use reset as a last resort for SQLite, NOT for Postgres
-        if (empty($pgContainer)) {
-            $cmd_reset = "docker exec -i {$n8nContainer} n8n user-management:reset --yes 2>&1";
-            $cliRes_reset = dockern8n_ssh_RunCommand($hostname, $username, $password, $cmd_reset);
-
-            if (stripos($cliRes_reset, "Successfully reset") !== false) {
-                return "success";
-            }
-
-            // Try without --yes just in case
-            $cmd_reset_no_yes = "docker exec -i {$n8nContainer} n8n user-management:reset 2>&1";
-            $cliRes_reset_no_yes = dockern8n_ssh_RunCommand($hostname, $username, $password, $cmd_reset_no_yes);
-            if (stripos($cliRes_reset_no_yes, "Successfully reset") !== false) {
-                return "success";
-            }
-            $errors[] = "CLI (reset): " . $cliRes_reset;
-        } else {
-            $errors[] = "Skipping CLI reset for Postgres to prevent user deletion.";
-        }
-
         $errors[] = "CLI (reset-owner): " . $cliRes_reset_owner;
-
-
-
-        return "All methods failed.\n" . implode("\n", $errors);
+        return "Password change failed: " . implode(" | ", $errors);
 
     } catch (Exception $e) {
         return "Error: " . $e->getMessage();
@@ -2151,28 +2184,28 @@ function dockern8n_CreateBackup($params)
         $password = $params["serverpassword"];
         $serviceId = $params["serviceid"];
 
-        // Detect PUQ vs our service
-        $puqInfo = DockerN8N_PUQCompat::detectPUQService($params);
-
+        $info = dockern8n_GetContainerInfo($params);
+        $serviceDir = $info['service_dir'];
+        $projectName = $info['project_name'];
+        
         $backupDir = "/var/www/dockern8n/backups/service-{$serviceId}";
-        $logFile = "/var/www/dockern8n/logs/backup-{$serviceId}.log";
         $timestamp = date("Y-m-d_H-i-s");
         $backupFile = "backup_{$timestamp}.tar.gz";
         $backupPath = "{$backupDir}/{$backupFile}";
 
-        // Determine paths based on service type
-        if ($puqInfo['is_puq']) {
-            // PUQCloud: backup from /mnt/{domain}/ or service directory
-            $serviceDir = $puqInfo['service_dir'];
-            $dataPath = $puqInfo['mount_dir']; // /mnt/{domain}/
-            $asyncCmd = "mkdir -p {$backupDir} && cd {$serviceDir} && docker-compose stop && tar -czf {$backupPath} -C {$dataPath} . && docker-compose up -d";
-        } else {
-            // Our module: backup named volume
-            $serviceDir = "/var/www/dockern8n/service-{$serviceId}";
-            $volumeName = "service-{$serviceId}_n8n-data";
-            $volumePath = "/var/lib/docker/volumes/{$volumeName}/_data";
-            $asyncCmd = "mkdir -p {$backupDir} && cd {$serviceDir} && docker compose stop && tar -czf {$backupPath} -C {$volumePath} . && docker compose up -d";
+        // Determine data path dynamically
+        $dataPath = $info['mount_dir'];
+        
+        // If mount_dir is empty or not found, fallback to named volume if not PUQ
+        if (!$info['is_puq'] && (empty($dataPath) || strpos($dataPath, '/mnt/') === false)) {
+            $volumeName = $projectName . "_n8n-data";
+            $dataPath = "/var/lib/docker/volumes/{$volumeName}/_data";
         }
+
+        $asyncCmd = "mkdir -p {$backupDir} && cd {$serviceDir} && " .
+            "(docker compose -p {$projectName} stop || docker-compose -p {$projectName} stop) && " .
+            "tar -czf {$backupPath} -C {$dataPath} . && " .
+            "(docker compose -p {$projectName} up -d || docker-compose -p {$projectName} up -d) 2>&1";
 
         // Run synchronously
         $output = dockern8n_ssh_RunCommand($hostname, $username, $password, $asyncCmd);
@@ -2247,28 +2280,27 @@ function dockern8n_RestoreBackup($params, $backupFilename)
             return array("success" => false, "message" => "Invalid backup filename");
         }
 
-        // Detect PUQ vs our service
-        $puqInfo = DockerN8N_PUQCompat::detectPUQService($params);
+        $info = dockern8n_GetContainerInfo($params);
+        $serviceDir = $info['service_dir'];
+        $projectName = $info['project_name'];
 
         $backupDir = "/var/www/dockern8n/backups/service-{$serviceId}";
         $backupPath = "{$backupDir}/{$backupFilename}";
-        $logFile = "/var/www/dockern8n/logs/restore-{$serviceId}.log";
 
-        // Build restore command based on service type
-        if ($puqInfo['is_puq']) {
-            $serviceDir = $puqInfo['service_dir'];
-            $dataPath = $puqInfo['mount_dir'];
-            $asyncCmd = "if [ ! -f {$backupPath} ]; then echo 'ERROR: Backup file not found' && exit 1; fi && " .
-                "cd {$serviceDir} && docker-compose stop && rm -rf {$dataPath}/* 2>/dev/null; " .
-                "tar -xzf {$backupPath} -C {$dataPath} && docker-compose up -d";
-        } else {
-            $serviceDir = "/var/www/dockern8n/service-{$serviceId}";
-            $volumeName = "service-{$serviceId}_n8n-data";
-            $volumePath = "/var/lib/docker/volumes/{$volumeName}/_data";
-            $asyncCmd = "if [ ! -f {$backupPath} ]; then echo 'ERROR: Backup file not found' && exit 1; fi && " .
-                "cd {$serviceDir} && docker compose stop && rm -rf {$volumePath}/* 2>/dev/null; " .
-                "tar -xzf {$backupPath} -C {$volumePath} && docker compose up -d";
+        // Determine data path dynamically
+        $dataPath = $info['mount_dir'];
+        if (!$info['is_puq'] && (empty($dataPath) || strpos($dataPath, '/mnt/') === false)) {
+            $volumeName = $projectName . "_n8n-data";
+            $dataPath = "/var/lib/docker/volumes/{$volumeName}/_data";
         }
+
+        $asyncCmd = "if [ ! -f " . $backupPath . " ]; then echo 'ERROR: Backup file not found' && exit 1; fi && " .
+            "cd " . $serviceDir . " && " .
+            "(docker compose -p " . $projectName . " stop || docker-compose -p " . $projectName . " stop) && " .
+            "rm -rf " . $dataPath . "/[^.]* " . $dataPath . "/.[!.]* 2>/dev/null; " .
+            "tar -xzf " . $backupPath . " -C " . $dataPath . " && " .
+            "(docker compose -p " . $projectName . " up -d || docker-compose -p " . $projectName . " up -d) 2>&1";
+
         // Run synchronously
         $restoreOutput = dockern8n_ssh_RunCommand($hostname, $username, $password, $asyncCmd);
 
@@ -2541,20 +2573,27 @@ function dockern8n_ImportWorkflows($params, $workflowData, $defaultName = "Impor
             if (is_array($workflow)) {
                 // Force set active to false
                 $workflow["active"] = false;
-                // Unset ID to force create new workflow and avoid updating broken active ones
-                if (isset($workflow["id"]))
-                    unset($workflow["id"]);
+                
+                // CRITICAL FIX: Unconditionally remove ID and versionId 
+                // This allows Postgres/n8n to generate new ones and avoids "violates not-null constraint" or "already exists"
+                unset($workflow["id"]);
+                unset($workflow["versionId"]);
+                unset($workflow["createdAt"]);
+                unset($workflow["updatedAt"]);
 
                 if (empty($workflow["name"])) {
                     $workflow["name"] = $defaultName . " " . date("Y-m-d H:i");
-                }if (!isset($workflow["versionId"])) {
-                    $workflow["versionId"] = sprintf("%04x%04x-%04x-%04x-%04x-%04x%04x%04x", mt_rand(0, 65535), mt_rand(0, 65535), mt_rand(0, 65535), mt_rand(0, 4095) | 16384, mt_rand(0, 16383) | 32768, mt_rand(0, 65535), mt_rand(0, 65535), mt_rand(0, 65535));
-                }if (!isset($workflow["nodes"])) {
+                }
+                
+                if (!isset($workflow["nodes"])) {
                     $workflow["nodes"] = array();
-                }if (!isset($workflow["connections"])) {
+                }
+                
+                if (!isset($workflow["connections"])) {
                     $workflow["connections"] = array();
                 }
-            }return $workflow;
+            }
+            return $workflow;
         };
         $importResults = array();
         $hasCredentials = false;
@@ -2836,46 +2875,40 @@ function dockern8n_GetContainerInfo($params)
     $hostname = $params["serverhostname"] ?: $params["serverip"];
     $username = $params["serverusername"];
     $password = $params["serverpassword"];
-    $domain = $params["domain"];
+    $domain = preg_replace("#^https?://#", '', $params['domain'] ?? '');
 
     // 1. Detect PUQ vs our service
     $puqInfo = DockerN8N_PUQCompat::detectPUQService($params);
 
-    // 2. Generate PUQ-Style names based on current metadata
-    $userId = $params['userid'];
-    $mainDomain = $params["configoption6"] ?? '';
-    if (empty($mainDomain)) {
-        // Fallback: extract base domain from current domain field
-        $parts = explode('.', $domain, 2);
-        $mainDomain = $parts[1] ?? $domain;
-    }
-    $mainDomain = preg_replace("#^https?://#", '', $mainDomain);
-    $mainDomain = rtrim($mainDomain, "/");
-
-    $prefix = "{$userId}-{$serviceId}";
-    $cleanDomain = $mainDomain;
-    $fullFQDN = "{$prefix}.{$cleanDomain}";
-    $puqProject = $prefix . str_replace('.', '', $cleanDomain);
-
-    // Default info structure
+    // 2. Native Module Defaults
+    $nativeDir = "/var/www/dockern8n/service-{$serviceId}";
+    $nativeProject = "service-{$serviceId}";
+    $nativeContainer = "service-{$serviceId}-n8n";
+    
+    // Default info structure (Native first, PUQ if detected)
     $info = [
         'is_puq' => $puqInfo['is_puq'],
-        'service_dir' => $puqInfo['is_puq'] ? $puqInfo['service_dir'] : "/opt/docker/clients/{$fullFQDN}",
-        'n8n_container' => $puqInfo['is_puq'] ? $puqInfo['container_name'] : $fullFQDN,
-        'postgres_container' => "{$fullFQDN}-postgres",
-        'compose_file' => ($puqInfo['service_dir'] ?? "/opt/docker/clients/{$fullFQDN}") . "/docker-compose.yml",
-        'project_name' => $puqInfo['is_puq'] ? ($puqInfo['project_name'] ?? $puqProject) : $puqProject,
-        'mount_dir' => $puqInfo['is_puq'] ? $puqInfo['mount_dir'] : "/mnt/{$fullFQDN}",
+        'service_dir' => $puqInfo['is_puq'] ? $puqInfo['service_dir'] : $nativeDir,
+        'n8n_container' => $puqInfo['is_puq'] ? $puqInfo['container_name'] : $nativeContainer,
+        'postgres_container' => $puqInfo['is_puq'] ? ($puqInfo['container_name'] . "-postgres") : "{$nativeProject}-postgres",
+        'compose_file' => ($puqInfo['service_dir'] ?? $nativeDir) . "/docker-compose.yml",
+        'project_name' => $puqInfo['is_puq'] ? ($puqInfo['project_name'] ?? $nativeProject) : $nativeProject,
+        'mount_dir' => $puqInfo['is_puq'] ? $puqInfo['mount_dir'] : "{$nativeDir}/n8n-data",
         'found' => $puqInfo['is_puq']
     ];
 
-    if ($info['is_puq']) {
-        return $info;
+    // 3. Smart Detection (Override defaults if container is found running)
+    // We check native names first, then domain-based names
+    $checkNames = [$nativeContainer, $domain, "service-{$serviceId}-n8n"];
+    if ($puqInfo['is_puq']) {
+         array_unshift($checkNames, $puqInfo['container_name']);
     }
 
-    // Try to find the container's actual working directory from Docker metadata
-    $containerNames = [$fullFQDN, "service-{$serviceId}-n8n", $cleanDomain];
-    foreach ($containerNames as $cName) {
+    $checked = [];
+    foreach ($checkNames as $cName) {
+        if (empty($cName) || in_array($cName, $checked)) continue;
+        $checked[] = $cName;
+
         $inspectCmd = "docker inspect {$cName} --format '{{ index .Config.Labels \"com.docker.compose.project.working_dir\" }}|{{ index .Config.Labels \"com.docker.compose.project\" }}' 2>/dev/null";
         $metadata = trim(dockern8n_ssh_RunCommand($hostname, $username, $password, $inspectCmd));
 
@@ -2884,15 +2917,29 @@ function dockern8n_GetContainerInfo($params)
             if ($workDir && $workDir != "<no value>") {
                 $info['service_dir'] = rtrim($workDir, '/');
                 $info['compose_file'] = $info['service_dir'] . "/docker-compose.yml";
-                $info['project_name'] = ($project && $project != "<no value>") ? $project : $puqProject;
                 $info['n8n_container'] = $cName;
                 $info['found'] = true;
-                return $info;
+            }
+            if ($project && $project != "<no value>") {
+                $info['project_name'] = $project;
+            }
+            
+            // If we found Postgres via label, use it
+            $info['postgres_container'] = $info['project_name'] . "-postgres";
+            return $info;
+        } else {
+            // Fallback: Check if the container simply exists (might not have labels if created manually or by old version)
+            $checkExist = "docker inspect {$cName} --format='{{.Id}}' 2>/dev/null";
+            $id = trim(dockern8n_ssh_RunCommand($hostname, $username, $password, $checkExist));
+            if (!empty($id) && strpos($id, 'Error') === false) {
+                $info['n8n_container'] = $cName;
+                $info['found'] = true;
+                // If we don't know the project name, we hope the defaults worked
             }
         }
     }
 
-    // Fallback: Check custom field
+    // 4. Fallback: Check custom field for manually set directory
     $customField = Capsule::table("tblcustomfields")->where("relid", $params["packageid"])->where("fieldname", "Service Details")->where("type", "product")->first();
     if ($customField) {
         $value = Capsule::table("tblcustomfieldsvalues")->where("fieldid", $customField->id)->where("relid", $serviceId)->value("value");
@@ -2907,6 +2954,7 @@ function dockern8n_GetContainerInfo($params)
 
     return $info;
 }
+
 
 function dockern8n_UpdateVersion($params, $newVersion)
 {
@@ -3021,20 +3069,24 @@ function dockern8n_SoftReset($params)
 
         $sql = "DELETE FROM project_membership; DELETE FROM user_roles; DELETE FROM auth_identity; DELETE FROM \"user\"; DELETE FROM role;";
 
-        // 1. OFFICIAL CLI RESET (Try this first)
+        // 1. OFFICIAL CLI RESET (Primary for v1+)
+        // This correctly wipes users and roles while preserving workflows.
         $cmdReset = "docker exec -u node {$n8nContainer} n8n user-management:reset --yes 2>&1";
         $resReset = dockern8n_ssh_RunCommand($hostname, $username, $password, $cmdReset, 120);
 
-        // 2. TIERED FALLBACK (If CLI fails, use DIRECT SQL on host file)
-        if (stripos($resReset, 'Error') !== false || stripos($resReset, 'failed') !== false || stripos($resReset, 'not found') !== false) {
-            $resetSqlCmd = "([ -f {$dbPath} ] && (sudo sqlite3 {$dbPath} '{$sql}' || sqlite3 {$dbPath} '{$sql}')) 2>&1";
-            $resSql = dockern8n_ssh_RunCommand($hostname, $username, $password, $resetSqlCmd, 60);
+        if (stripos($resReset, 'successfully') !== false || stripos($resReset, 'Reset database') !== false) {
+             dockern8n_ssh_RunCommand($hostname, $username, $password, "docker restart {$n8nContainer} 2>&1");
+             return array("success" => true, "message" => "Soft reset success! Users have been cleared. You can now setup a new owner account.");
+        }
 
-            if (stripos($resSql, 'Error') !== false) {
-                // Last resort: Sidecar container for SQLite volume access
-                $sidecar = "docker run --rm -v " . ($info['is_puq'] ? ($info['mount_dir'] ?: "/mnt/" . $params['domain']) : "{$info['project_name']}_n8n-data") . ":/data alpine sh -c \"apk add --no-cache sqlite && sqlite3 /data/database.sqlite '{$sql}'\" 2>&1";
-                dockern8n_ssh_RunCommand($hostname, $username, $password, $sidecar, 120);
-            }
+        // 2. TIERED FALLBACK (SQL Wipe)
+        $resetSqlCmd = "([ -f {$dbPath} ] && (sudo sqlite3 {$dbPath} '{$sql}' || sqlite3 {$dbPath} '{$sql}')) 2>&1";
+        $resSql = dockern8n_ssh_RunCommand($hostname, $username, $password, $resetSqlCmd, 60);
+
+        if (stripos($resSql, 'Error') !== false) {
+             // Last resort sidecar
+             $sidecar = "docker run --rm -v " . ($info['is_puq'] ? ($info['mount_dir'] ?: "/mnt/" . $params['domain']) : "{$info['project_name']}_n8n-data") . ":/data alpine sh -c \"apk add --no-cache sqlite && sqlite3 /data/database.sqlite '{$sql}'\" 2>&1";
+             dockern8n_ssh_RunCommand($hostname, $username, $password, $sidecar, 120);
         }
 
         // 3. FINAL REBOOT
@@ -3065,12 +3117,25 @@ function dockern8n_FullReset($params)
         // 1. STOP & WIPE
         if ($info['is_puq']) {
             $mountDir = $info['mount_dir'] ?: "/mnt/" . $params['domain'];
-            $cmdWipe = "cd {$serviceDir} && (docker compose -p {$projectName} down || docker stop {$n8nContainer}) && " .
-                "sudo rm -rf {$mountDir}/* && sudo rm -rf {$mountDir}/.* 2>/dev/null && " .
-                "sudo mount -a && (docker compose -p {$projectName} up -d || docker-compose -p {$projectName} up -d) 2>&1";
+            // For PUQ, we need to ensure we stop exactly what needs to be stopped, then wipe the mount.
+            $cmdWipe = "cd " . $serviceDir . " && " .
+                "(docker compose -p " . $projectName . " down || docker-compose -p " . $projectName . " down || docker stop " . $n8nContainer . ") && " .
+                "sudo rm -rf " . $mountDir . "/[^.]* " . $mountDir . "/.[!.]* 2>/dev/null; " .
+                "sudo mount -a && sleep 2 && " .
+                "sudo mkdir -p " . $mountDir . "/n8n " . $mountDir . "/postgres " . $mountDir . "/redis && " .
+                "sudo chmod 755 " . $mountDir . " && " .
+                "sudo chown -R 1000:1000 " . $mountDir . "/n8n && " .
+                "sudo chown -R 70:70 " . $mountDir . "/postgres && " .
+                "sudo chown -R 999:999 " . $mountDir . "/redis && " .
+                "(docker compose -p " . $projectName . " up -d || docker-compose -p " . $projectName . " up -d) 2>&1";
         } else {
-            $cmdWipe = "cd {$serviceDir} && (docker compose -p {$projectName} down -v --remove-orphans || docker-compose -p {$projectName} down -v --remove-orphans) && " .
-                "(docker compose -p {$projectName} up -d || docker-compose -p {$projectName} up -d) 2>&1";
+            // Module-native: use docker compose down -v to wipe volumes
+            $cmdWipe = "cd " . $serviceDir . " && " .
+                "(docker compose -p " . $projectName . " down -v --remove-orphans || docker-compose -p " . $projectName . " down -v --remove-orphans) && " .
+                "sudo rm -rf " . $info['service_dir'] . "/n8n-data/* 2>/dev/null; " .
+                "sudo chmod 755 " . $info['mount_dir'] . " && " .
+                "sudo chown -R 1000:1000 " . $info['mount_dir'] . " && " . // Ensure permissions after wipe
+                "(docker compose -p " . $projectName . " up -d || docker-compose -p " . $projectName . " up -d) 2>&1";
         }
 
         $output = dockern8n_ssh_RunCommand($hostname, $username, $password, $cmdWipe, 300);

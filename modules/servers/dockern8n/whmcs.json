@@ -1,8 +1,8 @@
 {
-    "schema": "1.0",
+    "schema": "3.0",
     "type": "whmcs-servers",
     "name": "dockern8n",
-    "license": "proprietary",
+    "license": "GPL3",
     "category": "servers",
     "description": {
         "name": "Docker N8N",
@@ -23,9 +23,9 @@
     },
     "support": {
         "homepage": "https://github.com/cyber-wahid",
-        "learn_more": "https://logicdock.cloud/n8n-hosting",
-        "email": "info@logicdock.cloud",
-        "docs_url": "docs.logicdock.cloud"
+        "learn_more": "https://github.com/cyber-wahid/docker-n8n-hosting-module-whmcs",
+        "email": "mrwhdbd@gmail.com",
+        "docs_url": "https://github.com/cyber-wahid/docker-n8n-hosting-module-whmcs"
     },
     "authors": [
         {
