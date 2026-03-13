@@ -1,0 +1,36 @@
+{
+    "schema": "1.0",
+    "type": "whmcs-servers",
+    "name": "dockern8n",
+    "license": "proprietary",
+    "category": "servers",
+    "description": {
+        "name": "Docker N8N",
+        "tagline": "Automated N8N Docker Container Provisioning",
+        "long": "A powerful WHMCS provisioning module for automated deployment and management of N8N workflow automation containers via Docker. Features include automatic subdomain generation, resource limiting (CPU, RAM, Disk), Let's Encrypt SSL integration via Nginx Proxy, and full PUQ Cloud compatibility.",
+        "features": [
+            "Automated N8N container provisioning",
+            "Custom subdomain formats with macros",
+            "CPU, Memory, and Disk resource limits",
+            "Let's Encrypt SSL via Nginx Proxy",
+            "PUQ Cloud module compatibility",
+            "Password reset and container management",
+            "Custom SSH port support"
+        ]
+    },
+    "logo": {
+        "filename": "logo.png"
+    },
+    "support": {
+        "homepage": "https://github.com/cyber-wahid",
+        "learn_more": "https://logicdock.cloud/n8n-hosting",
+        "email": "info@logicdock.cloud",
+        "docs_url": "docs.logicdock.cloud"
+    },
+    "authors": [
+        {
+            "name": "Md. Wahid",
+            "homepage": "https://github.com/cyber-wahid"
+        }
+    ]
+}
